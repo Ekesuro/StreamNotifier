@@ -52,3 +52,5 @@ The result is `dist/StreamNotifier.exe`.
 ## Built with
 
 [pywebview](https://pywebview.flowrl.com/) · [pystray](https://github.com/moses-palmer/pystray) · [winotify](https://github.com/versa-syahptr/winotify) · [Pillow](https://python-pillow.org/)
+
+Developed with help from [Claude](https://claude.com/claude-code) by Anthropic.
