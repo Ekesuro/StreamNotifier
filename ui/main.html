@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stream Notifier</title>
+<link rel="stylesheet" href="theme.css">
+<style>
+  body { display: flex; flex-direction: column; overflow: hidden; }
+
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 24px;
+    border-bottom: 1px solid var(--border); background: var(--surface);
+  }
+  .logo { width: 30px; height: 30px; border-radius: 8px; background: var(--accent); display: grid; place-items: center; }
+  .logo svg { width: 14px; height: 14px; fill: #fff; }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; }
+  .summary { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 8px; margin-left: 6px; }
+  .summary .count { color: var(--live); font-weight: 600; }
+  .spacer { flex: 1; }
+  .last { color: var(--muted); font-size: 12px; margin-right: 4px; }
+  .spin svg { animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  main { flex: 1; overflow-y: auto; padding: 22px 24px 32px; }
+  .section-title {
+    display: flex; align-items: center; gap: 8px; margin: 4px 0 12px; font-size: 13px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .06em;
+  }
+  .section-title + .grid { margin-bottom: 28px; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); }
+  .grid.small { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+
+  /* live card */
+  .card {
+    position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: var(--shadow); overflow: hidden; cursor: pointer;
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s;
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: var(--shadow-hover); }
+  .card.live:hover { border-color: color-mix(in srgb, var(--live) 45%, var(--border)); }
+  .card-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; }
+  .avatar { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; background: var(--surface-3); flex: none; }
+  .avatar.ph { display: grid; place-items: center; font-weight: 700; color: var(--muted); font-size: 14px; }
+  .who { min-width: 0; flex: 1; }
+  .name { font-weight: 650; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); min-width: 0; }
+  .sub .game { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .viewers { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; color: var(--text); flex: none; }
+
+  .thumb { position: relative; aspect-ratio: 16 / 9; background: var(--surface-3); overflow: hidden; }
+  .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .3s ease; }
+  .card:hover .thumb img { transform: scale(1.03); }
+  .thumb .badge {
+    position: absolute; top: 10px; left: 10px; background: #e5484d; color: #fff; font-size: 11px; font-weight: 700;
+    padding: 2px 7px; border-radius: 5px; letter-spacing: .05em;
+  }
+  .thumb .uptime {
+    position: absolute; bottom: 10px; left: 10px; background: rgba(0,0,0,.65); color: #fff; font-size: 12px;
+    padding: 2px 7px; border-radius: 5px;
+  }
+  .thumb .noimg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+
+  .card-body { padding: 11px 14px 4px; }
+  .title {
+    font-size: 13.5px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; min-height: calc(13.5px * 1.4 * 2); user-select: text;
+  }
+  .card-foot { display: flex; align-items: center; gap: 2px; padding: 4px 8px 8px 14px; }
+  .card-foot .plat { flex: 1; }
+
+  /* offline / small card */
+  .mini {
+    display: flex; align-items: center; gap: 11px; padding: 10px 6px 10px 12px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 12px; cursor: pointer; transition: background .12s, border-color .12s;
+  }
+  .mini:hover { background: var(--surface-2); }
+  .mini .avatar { filter: grayscale(.85); opacity: .75; }
+  .mini .status { font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; white-space: nowrap; min-width: 0; }
+  .mini .status .txt { overflow: hidden; text-overflow: ellipsis; }
+  .mini.problem .status { color: var(--danger); }
+  .mini .name { font-size: 14px; }
+
+  .empty { text-align: center; color: var(--muted); padding: 80px 20px; }
+  .empty h2 { color: var(--text); font-size: 18px; margin: 14px 0 6px; }
+  .empty .btn { margin-top: 18px; }
+  .banner {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px; margin-bottom: 20px; border-radius: 10px;
+    background: color-mix(in srgb, var(--accent) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  }
+  .banner .spacer { flex: 1; }
+
+  /* popup menu */
+  .menu {
+    position: fixed; z-index: 50; min-width: 190px; padding: 5px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-hover); display: none;
+  }
+  .menu.open { display: block; }
+  .menu button {
+    display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px;
+    background: none; cursor: pointer; text-align: left;
+  }
+  .menu button:hover { background: var(--surface-2); }
+  .menu button.danger { color: var(--danger); }
+  .menu hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; }
+
+  /* modals */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none; align-items: center; justify-content: center;
+    z-index: 100; padding: 20px;
+  }
+  .overlay.open { display: flex; animation: fade .12s ease; }
+  @keyframes fade { from { opacity: 0; } }
+  .modal {
+    width: min(520px, 100%); max-height: 100%; overflow-y: auto; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.35); padding: 22px 24px;
+  }
+  .modal h2 { margin: 0 0 4px; font-size: 18px; }
+  .modal .hint { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 22px; }
+  label.field { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
+  .input {
+    width: 100%; height: 38px; padding: 0 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface-2); outline: none; user-select: text;
+  }
+  .input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+  .seg { display: inline-flex; padding: 3px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px; gap: 2px; }
+  .seg button {
+    display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border: 0; border-radius: 6px;
+    background: none; cursor: pointer; color: var(--muted);
+  }
+  .seg button.sel { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 600; }
+  .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .detected { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 18px; }
+  .keys { border: 1px solid var(--border); border-radius: 10px; padding: 4px 14px 14px; margin-top: 12px; }
+  .keys-head { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .keys-head .plat { font-size: 13px; }
+  .keys-head a { margin-left: auto; font-size: 12.5px; color: var(--accent); cursor: pointer; text-decoration: none; }
+  .keys-head a:hover { text-decoration: underline; }
+  .keys label.field { font-weight: 500; margin-top: 10px; }
+  .row { display: flex; align-items: center; gap: 12px; }
+  .check { display: flex; align-items: center; gap: 10px; margin-top: 16px; cursor: pointer; }
+  .check input { width: 17px; height: 17px; accent-color: var(--accent); }
+  .divider { border: 0; border-top: 1px solid var(--border); margin: 20px 0 4px; }
+
+  .toast {
+    position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(20px); opacity: 0;
+    background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 9px; font-size: 13px;
+    transition: opacity .2s, transform .2s; pointer-events: none; z-index: 200;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><svg viewBox="0 0 24 24"><path d="M7 4.5v15l12.5-7.5z"/></svg></div>
+  <h1>Stream Notifier</h1>
+  <div class="summary" id="summary"></div>
+  <div class="spacer"></div>
+  <span class="last" id="last"></span>
+  <button class="icon-btn" id="refreshBtn" title="Refresh now"></button>
+  <button class="icon-btn" id="themeBtn" title="Theme"></button>
+  <button class="icon-btn" id="settingsBtn" title="Settings"></button>
+  <button class="btn primary" id="addBtn"></button>
+</header>
+
+<main id="main"></main>
+
+<div class="menu" id="menu"></div>
+
+<!-- Add streamer -->
+<div class="overlay" id="addModal">
+  <div class="modal">
+    <h2>Add streamer</h2>
+    <p class="hint">Paste a channel link (twitch.tv/… or kick.com/…) or type a channel name.</p>
+    <input class="input" id="addInput" placeholder="https://www.twitch.tv/channelname" spellcheck="false" autocomplete="off">
+    <div class="detected" id="addDetected"></div>
+    <label class="field">Platform</label>
+    <div class="seg" id="addPlatform">
+      <button data-v="twitch" class="sel">Twitch</button>
+      <button data-v="kick">Kick</button>
+    </div>
+    <div class="error" id="addError"></div>
+    <div class="modal-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="addConfirm">Add</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings -->
+<div class="overlay" id="settingsModal">
+  <div class="modal">
+    <h2>Settings</h2>
+    <p class="hint" id="settingsHint">Appearance, checking and API keys.</p>
+
+    <label class="field">Theme</label>
+    <div class="seg" id="themeSeg">
+      <button data-v="system">System</button>
+      <button data-v="light">Light</button>
+      <button data-v="dark">Dark</button>
+    </div>
+
+    <label class="field">Check every</label>
+    <div class="row">
+      <select class="input" id="interval" style="width:180px">
+        <option value="30">30 seconds</option>
+        <option value="60">1 minute</option>
+        <option value="120">2 minutes</option>
+        <option value="300">5 minutes</option>
+        <option value="600">10 minutes</option>
+      </select>
+    </div>
+
+    <label class="check"><input type="checkbox" id="startup"> Start with Windows (opens quietly in the tray)</label>
+
+    <hr class="divider">
+    <label class="field">API keys</label>
+    <div class="keys">
+      <div class="keys-head"><span class="plat twitch">Twitch</span><a data-dev="twitch">Get keys at dev.twitch.tv ↗</a></div>
+      <label class="field">Client ID</label>
+      <input class="input" id="twitchId" spellcheck="false" autocomplete="off">
+      <label class="field">Client Secret</label>
+      <input class="input" id="twitchSecret" type="password" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="keys">
+      <div class="keys-head"><span class="plat kick">Kick</span><a data-dev="kick">Get keys at kick.com ↗</a></div>
+      <label class="field">Client ID</label>
+      <input class="input" id="kickId" spellcheck="false" autocomplete="off">
+      <label class="field">Client Secret</label>
+      <input class="input" id="kickSecret" type="password" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="error" id="settingsError"></div>
+    <div class="modal-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="settingsSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm remove -->
+<div class="overlay" id="confirmModal">
+  <div class="modal" style="width:min(400px,100%)">
+    <h2 id="confirmTitle">Remove streamer?</h2>
+    <p class="hint" id="confirmText"></p>
+    <div class="modal-actions">
+      <button class="btn" data-close>Cancel</button>
+      <button class="btn primary" id="confirmOk" style="background:var(--danger);border-color:var(--danger)">Remove</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="common.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+let state = { streamers: [], theme: "system", has_keys: true };
+const api = () => window.pywebview.api;
+
+$("#refreshBtn").innerHTML = icon("refresh");
+$("#settingsBtn").innerHTML = icon("gear");
+$("#addBtn").innerHTML = icon("plus") + "Add streamer";
+
+// ---------- rendering
+function avatarHtml(s) {
+  const letter = esc((s.display || s.name)[0].toUpperCase());
+  return s.avatar
+    ? `<img class="avatar" src="${esc(s.avatar)}" alt="" onerror="this.outerHTML='<div class=&quot;avatar ph&quot;>${letter}</div>'">`
+    : `<div class="avatar ph">${letter}</div>`;
+}
+const key = s => `${s.platform}|${s.name}`;
+
+function liveCard(s) {
+  const up = fmtUptime(s.started);
+  return `
+  <div class="card live" data-key="${esc(key(s))}">
+    <div class="card-head">
+      ${avatarHtml(s)}
+      <div class="who">
+        <div class="name">${esc(s.display || s.name)}</div>
+        <div class="sub"><span class="game">${esc(s.game || "Live")}</span></div>
+      </div>
+      <div class="viewers" title="${Number(s.viewers || 0).toLocaleString()} viewers"><span class="dot live"></span>${fmtViewers(s.viewers)}</div>
+    </div>
+    <div class="thumb">
+      <div class="noimg">No preview</div>
+      ${s.thumb ? `<img src="${esc(s.thumb)}" alt="" loading="lazy" onerror="this.remove()">` : ""}
+      <span class="badge">LIVE</span>
+      ${up ? `<span class="uptime">${up}</span>` : ""}
+    </div>
+    <div class="card-body"><div class="title" title="${esc(s.title)}">${esc(s.title || "Untitled stream")}</div></div>
+    <div class="card-foot">
+      <span class="plat ${s.platform}">${PLATFORM[s.platform]}</span>
+      ${bellBtn(s)}
+      <button class="icon-btn" data-act="menu" title="More">${icon("more")}</button>
+    </div>
+  </div>`;
+}
+
+function bellBtn(s) {
+  return `<button class="icon-btn ${s.notify ? "on" : ""}" data-act="bell"
+    title="${s.notify ? "Notifications on - click to mute" : "Notifications off - click to enable"}">${icon(s.notify ? "bell" : "bellOff")}</button>`;
+}
+
+function miniCard(s) {
+  const map = {
+    offline: ["Offline", "", ""],
+    checking: ["Checking…", "unknown", ""],
+    notfound: ["Channel not found", "unknown", "problem"],
+    nokeys: ["Add API keys in Settings", "unknown", "problem"],
+    error: [s.error || "Error", "unknown", "problem"],
+  };
+  const [text, dotCls, cls] = map[s.state] || map.checking;
+  return `
+  <div class="mini ${cls}" data-key="${esc(key(s))}" title="${esc(s.stale ? "Last check failed: " + s.stale : "")}">
+    ${avatarHtml(s)}
+    <div class="who">
+      <div class="name">${esc(s.display || s.name)}</div>
+      <div class="status" title="${esc(text)}"><span class="dot ${dotCls}"></span><span class="plat ${s.platform}">${PLATFORM[s.platform]}</span>·<span class="txt">${esc(text)}</span></div>
+    </div>
+    ${bellBtn(s)}
+    <button class="icon-btn" data-act="menu" title="More">${icon("more")}</button>
+  </div>`;
+}
+
+function render() {
+  const list = sortStreamers(state.streamers);
+  const live = list.filter(s => s.state === "live");
+  const rest = list.filter(s => s.state !== "live");
+
+  $("#summary").innerHTML = list.length
+    ? `<span class="dot ${live.length ? "live" : ""}"></span><span class="count">${live.length} live</span> · ${rest.length} offline`
+    : "";
+  $("#last").textContent = state.last_check ? `Updated ${state.last_check}` : "";
+
+  let html = "";
+  if (!state.has_keys) {
+    html += `<div class="banner">${icon("gear")}<div><b>Add your API keys</b> so the app can check who is live.</div>
+             <div class="spacer"></div><button class="btn primary" onclick="openSettings()">Open settings</button></div>`;
+  }
+  if (!list.length) {
+    html += `<div class="empty">${icon("users")}<h2>No streamers yet</h2><div>Add a Twitch or Kick channel to get notified when it goes live.</div>
+             <button class="btn primary" onclick="openAdd()">${icon("plus")}Add streamer</button></div>`;
+  } else {
+    if (live.length) html += `<div class="section-title"><span class="dot live"></span>Live now · ${live.length}</div>
+                              <div class="grid">${live.map(liveCard).join("")}</div>`;
+    if (rest.length) html += `<div class="section-title">Offline · ${rest.length}</div>
+                              <div class="grid small">${rest.map(miniCard).join("")}</div>`;
+  }
+  const scroll = $("#main").scrollTop;
+  $("#main").innerHTML = html;
+  $("#main").scrollTop = scroll;
+  setThemeButton();
+}
+
+window.onState = s => {
+  state = s;
+  applyTheme(s.theme);
+  render();
+  $("#refreshBtn").classList.remove("spin");
+};
+setInterval(render, 60000); // keep uptime fresh
+
+// ---------- card interactions
+const find = k => state.streamers.find(s => key(s) === k);
+$("#main").addEventListener("click", e => {
+  const card = e.target.closest("[data-key]");
+  if (!card) return;
+  const s = find(card.dataset.key);
+  if (!s) return;
+  const act = e.target.closest("[data-act]")?.dataset.act;
+  if (act === "bell") {
+    s.notify = !s.notify;  // optimistic
+    render();
+    api().toggle_notify(s.platform, s.name);
+    toast(s.notify ? `Notifications on for ${s.display || s.name}` : `Notifications muted for ${s.display || s.name}`);
+  } else if (act === "menu") {
+    openMenu(e.target.closest("button"), s);
+  } else {
+    api().open_stream(s.platform, s.name);
+  }
+});
+
+function openMenu(btn, s) {
+  const m = $("#menu");
+  m.innerHTML = `
+    <button data-m="open">${icon("external")}Open stream</button>
+    <button data-m="bell">${icon(s.notify ? "bellOff" : "bell")}${s.notify ? "Mute notifications" : "Turn on notifications"}</button>
+    <hr>
+    <button data-m="remove" class="danger">${icon("trash")}Remove</button>`;
+  m.classList.add("open");
+  const r = btn.getBoundingClientRect(), mw = m.offsetWidth, mh = m.offsetHeight;
+  m.style.left = Math.max(8, Math.min(r.right - mw, innerWidth - mw - 8)) + "px";
+  m.style.top = (r.bottom + mh + 8 > innerHeight ? r.top - mh - 4 : r.bottom + 4) + "px";
+  m.onclick = ev => {
+    const a = ev.target.closest("[data-m]")?.dataset.m;
+    closeMenu();
+    if (a === "open") api().open_stream(s.platform, s.name);
+    if (a === "bell") { s.notify = !s.notify; render(); api().toggle_notify(s.platform, s.name); }
+    if (a === "remove") confirmRemove(s);
+  };
+}
+function closeMenu() { $("#menu").classList.remove("open"); }
+document.addEventListener("mousedown", e => { if (!e.target.closest("#menu")) closeMenu(); });
+$("#main").addEventListener("scroll", closeMenu);
+
+// ---------- header buttons
+$("#refreshBtn").onclick = () => { $("#refreshBtn").classList.add("spin"); api().refresh(); };
+$("#addBtn").onclick = () => openAdd();
+$("#settingsBtn").onclick = () => openSettings();
+const THEME_CYCLE = { system: "light", light: "dark", dark: "system" };
+function setThemeButton() {
+  const t = currentTheme;
+  $("#themeBtn").innerHTML = icon(t === "system" ? "monitor" : t === "light" ? "sun" : "moon");
+  $("#themeBtn").title = `Theme: ${t[0].toUpperCase() + t.slice(1)} (click to change)`;
+}
+$("#themeBtn").onclick = () => {
+  const t = THEME_CYCLE[currentTheme];
+  applyTheme(t); setThemeButton(); api().set_theme(t);
+  toast(`Theme: ${t[0].toUpperCase() + t.slice(1)}`);
+};
+
+// ---------- modals
+function openModal(id) { $(id).classList.add("open"); }
+function closeModals() { document.querySelectorAll(".overlay.open").forEach(o => o.classList.remove("open")); }
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = closeModals);
+document.querySelectorAll(".overlay").forEach(o => o.addEventListener("mousedown", e => { if (e.target === o) closeModals(); }));
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeModals(); closeMenu(); } });
+function seg(el, value) {
+  el.querySelectorAll("button").forEach(b => b.classList.toggle("sel", b.dataset.v === value));
+}
+function segValue(el) { return el.querySelector("button.sel")?.dataset.v; }
+document.querySelectorAll(".seg").forEach(el => el.addEventListener("click", e => {
+  const b = e.target.closest("button"); if (b) seg(el, b.dataset.v);
+}));
+
+// add
+function detectPlatform(text) {
+  const m = text.match(/(twitch\.tv|kick\.com)\/(?:popout\/)?([A-Za-z0-9_\-]+)/i);
+  return m ? { platform: m[1].toLowerCase().startsWith("twitch") ? "twitch" : "kick", name: m[2].toLowerCase() } : null;
+}
+window.openAdd = () => {
+  $("#addInput").value = ""; $("#addError").textContent = ""; $("#addDetected").textContent = "";
+  openModal("#addModal"); setTimeout(() => $("#addInput").focus(), 30);
+};
+$("#addInput").addEventListener("input", () => {
+  const d = detectPlatform($("#addInput").value);
+  $("#addError").textContent = "";
+  if (d) { seg($("#addPlatform"), d.platform); $("#addDetected").textContent = `Detected: ${d.name} on ${PLATFORM[d.platform]}`; }
+  else $("#addDetected").textContent = "";
+});
+async function doAdd() {
+  const r = await api().add_streamer($("#addInput").value, segValue($("#addPlatform")));
+  if (!r.ok) { $("#addError").textContent = r.error; return; }
+  closeModals(); toast(`Added ${r.name} (${PLATFORM[r.platform]}) - checking…`);
+}
+$("#addConfirm").onclick = doAdd;
+$("#addInput").addEventListener("keydown", e => { if (e.key === "Enter") doAdd(); });
+
+// remove
+function confirmRemove(s) {
+  $("#confirmText").textContent = `${s.display || s.name} (${PLATFORM[s.platform]}) will be removed from your list.`;
+  openModal("#confirmModal");
+  $("#confirmOk").onclick = () => {
+    closeModals();
+    state.streamers = state.streamers.filter(x => key(x) !== key(s)); render();
+    api().remove_streamer(s.platform, s.name);
+    toast(`Removed ${s.display || s.name}`);
+  };
+}
+
+// settings
+let themeBeforeSettings = null;
+window.openSettings = async (firstRun) => {
+  const s = await api().get_settings();
+  themeBeforeSettings = s.theme;
+  seg($("#themeSeg"), s.theme);
+  const iv = $("#interval");
+  if (![...iv.options].some(o => o.value == s.interval)) iv.add(new Option(`${s.interval} seconds`, s.interval));
+  iv.value = String(s.interval);
+  $("#startup").checked = s.startup;
+  $("#twitchId").value = s.twitch.client_id; $("#twitchSecret").value = s.twitch.client_secret;
+  $("#kickId").value = s.kick.client_id; $("#kickSecret").value = s.kick.client_secret;
+  $("#settingsError").textContent = "";
+  $("#settingsHint").textContent = firstRun
+    ? "Welcome! Add your Twitch and Kick API keys so the app can check who is live."
+    : "Appearance, checking and API keys.";
+  openModal("#settingsModal");
+};
+$("#themeSeg").addEventListener("click", () => applyTheme(segValue($("#themeSeg"))));  // live preview
+document.querySelectorAll("#settingsModal [data-close]").forEach(b => b.addEventListener("click", () => {
+  if (themeBeforeSettings) applyTheme(themeBeforeSettings);
+}));
+document.querySelectorAll("[data-dev]").forEach(a => a.onclick = () => api().open_dev_console(a.dataset.dev));
+$("#settingsSave").onclick = async () => {
+  const r = await api().save_settings({
+    theme: segValue($("#themeSeg")), interval: Number($("#interval").value), startup: $("#startup").checked,
+    twitch: { client_id: $("#twitchId").value, client_secret: $("#twitchSecret").value },
+    kick: { client_id: $("#kickId").value, client_secret: $("#kickSecret").value },
+  });
+  if (!r.ok) { $("#settingsError").textContent = r.error; return; }
+  themeBeforeSettings = null;
+  closeModals(); toast("Settings saved");
+};
+
+let toastTimer;
+function toast(msg) {
+  const t = $("#toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+
+onApiReady(async () => {
+  window.onState(await api().get_state());
+  api().ready("main");
+});
+</script>
+</body>
+</html>

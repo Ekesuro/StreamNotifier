@@ -1,0 +1,14 @@
+# Build output
+build/
+dist/
+*.spec
+assets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local tooling
+.claude/
