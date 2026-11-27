@@ -131,6 +131,8 @@
   .seg button.sel { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 600; }
   .error { color: var(--danger); font-size: 13px; margin-top: 10px; min-height: 18px; }
   .detected { font-size: 12.5px; color: var(--muted); margin-top: 8px; min-height: 18px; }
+  .detected b { color: var(--text); }
+  .detected .ok-mark { color: var(--live, #22c55e); font-weight: 700; }
   .keys { border: 1px solid var(--border); border-radius: 10px; padding: 4px 14px 14px; margin-top: 12px; }
   .keys-head { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
   .keys-head .plat { font-size: 13px; }
@@ -190,10 +192,12 @@
     <p class="hint">Paste a channel link (twitch.tv/… or kick.com/…) or type a channel name.</p>
     <input class="input" id="addInput" placeholder="https://www.twitch.tv/channelname" spellcheck="false" autocomplete="off">
     <div class="detected" id="addDetected"></div>
-    <label class="field">Platform</label>
-    <div class="seg" id="addPlatform">
-      <button data-v="twitch" class="sel">Twitch</button>
-      <button data-v="kick">Kick</button>
+    <div id="addPlatformBox" hidden>
+      <label class="field">Which platform is this channel on?</label>
+      <div class="seg" id="addPlatform">
+        <button data-v="twitch">Twitch</button>
+        <button data-v="kick">Kick</button>
+      </div>
     </div>
     <div class="error" id="addError"></div>
     <div class="modal-actions">
@@ -469,18 +473,29 @@ function detectPlatform(text) {
   const m = text.match(/(twitch\.tv|kick\.com)\/(?:popout\/)?([A-Za-z0-9_\-]+)/i);
   return m ? { platform: m[1].toLowerCase().startsWith("twitch") ? "twitch" : "kick", name: m[2].toLowerCase() } : null;
 }
+// A twitch.tv / kick.com link says which platform it is; only a plain channel name needs the Twitch/Kick choice
+function updateAddForm() {
+  const text = $("#addInput").value.trim();
+  const d = detectPlatform(text);
+  $("#addError").textContent = "";
+  $("#addDetected").innerHTML = d ? `<span class="ok-mark">✓</span> <b>${esc(d.name)}</b> on ${PLATFORM[d.platform]}` : "";
+  $("#addPlatformBox").hidden = !!d || !text;
+}
 window.openAdd = () => {
-  $("#addInput").value = ""; $("#addError").textContent = ""; $("#addDetected").textContent = "";
+  $("#addInput").value = "";
+  seg($("#addPlatform"), null);  // no remembered choice: a plain name must be assigned on purpose
+  updateAddForm();
   openModal("#addModal"); setTimeout(() => $("#addInput").focus(), 30);
 };
-$("#addInput").addEventListener("input", () => {
-  const d = detectPlatform($("#addInput").value);
-  $("#addError").textContent = "";
-  if (d) { seg($("#addPlatform"), d.platform); $("#addDetected").textContent = `Detected: ${d.name} on ${PLATFORM[d.platform]}`; }
-  else $("#addDetected").textContent = "";
-});
+$("#addInput").addEventListener("input", updateAddForm);
+$("#addPlatform").addEventListener("click", () => { $("#addError").textContent = ""; });
 async function doAdd() {
-  const r = await api().add_streamer($("#addInput").value, segValue($("#addPlatform")));
+  const text = $("#addInput").value.trim();
+  const d = detectPlatform(text);
+  if (!text) { $("#addError").textContent = "Paste a channel link or type a channel name."; return; }
+  const platform = d ? d.platform : segValue($("#addPlatform"));
+  if (!platform) { $("#addError").textContent = "Choose Twitch or Kick for this channel name."; return; }
+  const r = await api().add_streamer(text, platform);
   if (!r.ok) { $("#addError").textContent = r.error; return; }
   closeModals(); toast(`Added ${r.name} (${PLATFORM[r.platform]}) - checking…`);
 }
