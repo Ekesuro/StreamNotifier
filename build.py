@@ -29,13 +29,19 @@ def make_icon(size):
 os.makedirs("assets", exist_ok=True)
 make_icon(256).save("assets/icon.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
 
+# PyInstaller's work files go to %TEMP%: inside a OneDrive folder, syncing locks them ("Access is denied")
+import tempfile  # noqa: E402
+
+work = os.path.join(tempfile.gettempdir(), "StreamNotifier-build")
+
 subprocess.run([
     sys.executable, "-m", "PyInstaller",
     "--noconfirm", "--clean",
+    "--workpath", work, "--specpath", work,
     "--onefile", "--windowed",
     "--name", "StreamNotifier",
-    "--icon", "assets/icon.ico",
-    "--add-data", f"ui{os.pathsep}ui",
+    "--icon", os.path.join(HERE, "assets", "icon.ico"),
+    "--add-data", f"{os.path.join(HERE, 'ui')}{os.pathsep}ui",
     "--collect-all", "webview",
     "stream_notifier.py",
 ], check=True)
