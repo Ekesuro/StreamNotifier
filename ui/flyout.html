@@ -7,9 +7,14 @@
 <style>
   html, body { height: auto; background: var(--surface); overflow: hidden; }
   #wrap { border: 1px solid var(--border); min-height: 100vh; display: flex; flex-direction: column; }
-  .head { display: flex; align-items: center; gap: 9px; padding: 13px 14px 9px; }
-  .head b { font-size: 14px; font-weight: 650; }
-  .head .count { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .head { display: flex; align-items: center; gap: 2px; padding: 6px 6px 4px 0; }
+  .head .drag { flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px; padding: 7px 4px 5px 14px; cursor: move; }
+  .head .drag * { pointer-events: none; }  /* clicks on the title text still start a drag */
+  .head b { font-size: 14px; font-weight: 650; white-space: nowrap; }
+  .head .count { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .head .icon-btn { width: 28px; height: 28px; }
+  .head .icon-btn svg { width: 15px; height: 15px; }
+  .head .icon-btn.on { color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); }
   .list { padding: 0 6px 6px; max-height: 560px; overflow-y: auto; }
   .item {
     display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer;
@@ -39,7 +44,11 @@
 </head>
 <body>
 <div id="wrap">
-  <div class="head"><span class="dot" id="headDot"></span><b>Stream Notifier</b><span class="count" id="count"></span></div>
+  <div class="head">
+    <div class="drag pywebview-drag-region" title="Drag to move"><span class="dot" id="headDot"></span><b>Stream Notifier</b><span class="count" id="count"></span></div>
+    <button class="icon-btn" id="pinBtn"></button>
+    <button class="icon-btn" id="closeBtn" title="Close (Esc)"></button>
+  </div>
   <div class="list" id="list"></div>
   <div class="foot">
     <button id="openBtn"></button>
@@ -58,6 +67,15 @@ $("#openBtn").innerHTML = icon("window") + "Open app";
 $("#refreshBtn").innerHTML = icon("refresh") + "Refresh";
 $("#settingsBtn").innerHTML = icon("gear") + "Settings";
 $("#quitBtn").innerHTML = icon("power") + "Quit";
+$("#pinBtn").innerHTML = icon("pin");
+$("#closeBtn").innerHTML = icon("x");
+
+function renderPin() {
+  $("#pinBtn").classList.toggle("on", !!state.flyout_pinned);
+  $("#pinBtn").title = state.flyout_pinned
+    ? "Pinned: stays open and on top (click to unpin)"
+    : "Pin: keep open and on top of other windows";
+}
 
 function render() {
   const list = sortStreamers(state.streamers);
@@ -78,6 +96,7 @@ function render() {
       </span>
     </div>`;
   }).join("") : `<div class="empty">No streamers yet - open the app to add some.</div>`;
+  renderPin();
   reportSize();
 }
 
@@ -98,6 +117,8 @@ $("#openBtn").onclick = () => api().open_main("");
 $("#settingsBtn").onclick = () => api().open_main("settings");
 $("#refreshBtn").onclick = () => { $("#refreshBtn").classList.add("spin"); api().refresh(); };
 $("#quitBtn").onclick = () => api().quit();
+$("#pinBtn").onclick = () => { state.flyout_pinned = !state.flyout_pinned; renderPin(); api().flyout_pin(state.flyout_pinned); };
+$("#closeBtn").onclick = () => api().hide_flyout();
 document.addEventListener("keydown", e => { if (e.key === "Escape") api().hide_flyout(); });
 
 onApiReady(async () => {

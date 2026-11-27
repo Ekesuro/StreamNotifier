@@ -66,6 +66,7 @@ def load_config():
         "kick": {"client_id": "", "client_secret": ""},
         "interval": 60,
         "theme": "system",
+        "flyout": {"pos": None, "pinned": False},  # quick view: saved top-left [x, y] in screen pixels
         "streamers": [{"platform": p, "name": n, "notify": True} for p, n in DEFAULT_STREAMERS],
     }
     try:
@@ -534,11 +535,49 @@ def describe_error(e):
 
 # ---------------------------------------------------------------- Windows helpers
 
-user32 = ctypes.windll.user32
+# Own handle (not ctypes.windll.user32) so the argtypes below don't affect pywebview's calls.
+# Without argtypes, HWND_TOPMOST (-1) is passed as a 32-bit int and SetWindowPos silently fails.
+user32 = ctypes.WinDLL("user32")
 dwmapi = ctypes.windll.dwmapi
-HWND_TOPMOST = -1
-SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_FRAMECHANGED, SWP_SHOWWINDOW = 0x1, 0x2, 0x4, 0x20, 0x40
+_HWND = wt.HWND
+for _name, _args, _res in (
+        ("FindWindowW", [wt.LPCWSTR, wt.LPCWSTR], _HWND),
+        ("GetForegroundWindow", [], _HWND),
+        ("SetForegroundWindow", [_HWND], wt.BOOL),
+        ("ShowWindow", [_HWND, ctypes.c_int], wt.BOOL),
+        ("SetWindowPos", [_HWND, _HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT], wt.BOOL),
+        ("GetWindowLongW", [_HWND, ctypes.c_int], ctypes.c_long),
+        ("SetWindowLongW", [_HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long),
+        ("GetWindowRect", [_HWND, ctypes.POINTER(wt.RECT)], wt.BOOL),
+        ("GetDpiForWindow", [_HWND], wt.UINT),
+        ("GetAsyncKeyState", [ctypes.c_int], ctypes.c_short)):
+    _f = getattr(user32, _name)
+    _f.argtypes, _f.restype = _args, _res
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_FRAMECHANGED, SWP_SHOWWINDOW = 0x1, 0x2, 0x4, 0x10, 0x20, 0x40
 GWL_EXSTYLE, WS_EX_TOOLWINDOW, WS_EX_APPWINDOW = -20, 0x80, 0x40000
+VK_LBUTTON = 0x01
+user32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+user32.MonitorFromPoint.restype = ctypes.c_void_p
+user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+
+def monitor_work_area(x, y):
+    """Work area (screen minus taskbar) of the monitor nearest to the point."""
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(mi)
+    user32.GetMonitorInfoW(user32.MonitorFromPoint(wt.POINT(int(x), int(y)), 2), ctypes.byref(mi))  # NEAREST
+    return mi.rcWork
+
+
+def window_rect(hwnd):
+    r = wt.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return r
 
 
 def find_hwnd(title):
@@ -643,7 +682,7 @@ class JsApi:
 
     def open_stream(self, platform, name):
         webbrowser.open(stream_url(platform, name))
-        self._app.hide_flyout()
+        self._app.dismiss_flyout()
 
     def open_dev_console(self, platform):
         if platform in DEV_LINKS:
@@ -686,6 +725,9 @@ class JsApi:
     def hide_flyout(self):
         self._app.hide_flyout()
 
+    def flyout_pin(self, pinned):
+        self._app.set_flyout_pinned(bool(pinned))
+
     def open_main(self, page=""):
         self._app.show_main(page)
 
@@ -722,10 +764,12 @@ class App:
             APP, url=os.path.join(UI_DIR, "main.html"), js_api=api, width=1180, height=760,
             min_size=(560, 420), hidden=start_hidden and self.has_any_keys(),
             background_color="#0f0f12" if dark else "#f4f4f6")
+        # x/y given so Windows doesn't re-center it on first show; position_flyout() places it properly
         self.flyout = webview.create_window(
-            FLYOUT_TITLE, url=os.path.join(UI_DIR, "flyout.html"), js_api=api, width=340, height=420,
-            frameless=True, easy_drag=False, resizable=False, on_top=True, hidden=True,
+            FLYOUT_TITLE, url=os.path.join(UI_DIR, "flyout.html"), js_api=api, width=340, height=420, x=0, y=0,
+            frameless=True, easy_drag=False, resizable=False, on_top=False, hidden=True,
             background_color="#1a1a1f" if dark else "#ffffff")
+        self.flyout_xy = None  # where position_flyout() last put it (to notice user drags)
         self.main.events.closing += self.on_main_closing
 
     # ----- state
@@ -801,6 +845,7 @@ class App:
                               "url": stream_url(s["platform"], s["name"])})
             return {"streamers": items, "theme": self.cfg.get("theme", "system"),
                     "last_check": self.last_check, "has_keys": self.has_any_keys(),
+                    "flyout_pinned": bool(self.cfg["flyout"].get("pinned")),
                     "twitch_auth": twitch}
 
     def push_state(self):
@@ -991,6 +1036,7 @@ class App:
             pystray.MenuItem("Quick view", lambda: self.toggle_flyout(), default=True, visible=False),
             pystray.MenuItem("Open Stream Notifier", lambda: self.show_main()),
             pystray.MenuItem("Refresh now", lambda: self.wake.set()),
+            pystray.MenuItem("Reset quick view position", lambda: self.reset_flyout_position()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda: self.quit()),
         ))
@@ -1009,12 +1055,55 @@ class App:
             return None
         scale = window_scale(hwnd)
         w, h = int(self.flyout_css[0] * scale), int(self.flyout_css[1] * scale)
-        wa = work_area()
-        m = int(12 * scale)
-        x = wa.left + m if wa.left > 0 else wa.right - w - m       # taskbar on the left?
-        y = wa.top + m if wa.top > 0 else wa.bottom - h - m        # taskbar at the top?
-        user32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW if self.flyout_visible else 0)
+        pos = self.cfg["flyout"].get("pos")
+        if pos:  # where the user dragged it, kept fully on that monitor's screen
+            wa = monitor_work_area(pos[0] + w // 2, pos[1] + 20)
+            x = max(wa.left, min(int(pos[0]), wa.right - w))
+            y = max(wa.top, min(int(pos[1]), wa.bottom - h))
+        else:    # default: next to the tray, on the main screen
+            wa = work_area()
+            m = int(12 * scale)
+            x = wa.left + m if wa.left > 0 else wa.right - w - m   # taskbar on the left?
+            y = wa.top + m if wa.top > 0 else wa.bottom - h - m    # taskbar at the top?
+        after = HWND_TOPMOST if self.cfg["flyout"].get("pinned") else HWND_NOTOPMOST
+        user32.SetWindowPos(hwnd, after, x, y, w, h, SWP_SHOWWINDOW if self.flyout_visible else SWP_NOACTIVATE)
+        self.flyout_xy = (x, y)
         return hwnd
+
+    def remember_flyout_pos(self, hwnd):
+        """If the user dragged the quick view somewhere else, save that spot."""
+        if not hwnd or self.flyout_xy is None or user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000:
+            return  # still dragging
+        r = window_rect(hwnd)
+        if (r.left, r.top) != self.flyout_xy and r.right > r.left:
+            self.flyout_xy = (r.left, r.top)
+            with self.lock:
+                self.cfg["flyout"]["pos"] = [r.left, r.top]
+                save_config(self.cfg)
+
+    def reset_flyout_position(self):
+        with self.lock:
+            self.cfg["flyout"]["pos"] = None
+            save_config(self.cfg)
+        if self.flyout_visible:
+            self.position_flyout()
+        else:
+            self.show_flyout()  # show where it is now, so the reset is visible
+
+    def set_flyout_pinned(self, pinned):
+        with self.lock:
+            self.cfg["flyout"]["pinned"] = pinned
+            save_config(self.cfg)
+        hwnd = find_hwnd(FLYOUT_TITLE)
+        if hwnd:
+            user32.SetWindowPos(hwnd, HWND_TOPMOST if pinned else HWND_NOTOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        self.push_state()
+
+    def dismiss_flyout(self):
+        """Close the quick view after an action, unless it's pinned."""
+        if not self.cfg["flyout"].get("pinned"):
+            self.hide_flyout()
 
     def prepare_flyout(self):
         hwnd = find_hwnd(FLYOUT_TITLE)
@@ -1042,11 +1131,12 @@ class App:
         threading.Thread(target=self._watch_flyout_focus, daemon=True).start()
 
     def _watch_flyout_focus(self):
-        """Close the quick view when the user clicks anywhere else (like Windows flyouts)."""
+        """Remember drags, and close the quick view when the user clicks anywhere else (unless pinned)."""
         time.sleep(0.35)
         hwnd = find_hwnd(FLYOUT_TITLE)
         while self.flyout_visible and not self.quitting:
-            if user32.GetForegroundWindow() != hwnd:
+            self.remember_flyout_pos(hwnd)
+            if not self.cfg["flyout"].get("pinned") and user32.GetForegroundWindow() != hwnd:
                 self.hide_flyout()
                 return
             time.sleep(0.1)
@@ -1054,6 +1144,7 @@ class App:
     def hide_flyout(self):
         if not self.flyout_visible:
             return
+        self.remember_flyout_pos(find_hwnd(FLYOUT_TITLE))
         self.flyout_visible = False
         self.flyout_hidden_at = time.time()
         try:
@@ -1063,7 +1154,7 @@ class App:
 
     # ----- main window
     def show_main(self, page=""):
-        self.hide_flyout()
+        self.dismiss_flyout()
         self.main.show()
         hwnd = find_hwnd(APP)
         if hwnd:
