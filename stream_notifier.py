@@ -1,7 +1,9 @@
 """Stream Notifier - tray app that tells you when Twitch / Kick streamers go live.
 
 UI: pywebview (Edge WebView2) pages in ./ui, tray icon via pystray, toasts via winotify.
-Uses the official Twitch Helix API and the official Kick public API (app keys entered in Settings).
+Twitch: the user signs in with their Twitch account (no API keys needed); EventSub WebSockets give instant
+"went live" alerts, Helix polling supplies viewers/previews. The user's own Twitch app keys still work as a fallback.
+Kick: official public API with the user's own app keys (entered in Settings).
 Settings and the streamer list are stored in %APPDATA%\\StreamNotifier\\config.json.
 """
 
@@ -21,6 +23,7 @@ import webbrowser
 import winreg
 
 import pystray
+import websocket
 import webview
 from PIL import Image, ImageDraw
 from winotify import Notification, audio
@@ -39,6 +42,10 @@ STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\St
 UA = "StreamNotifier/2.0 (personal desktop app)"
 PLATFORM_LABEL = {"twitch": "Twitch", "kick": "Kick"}
 DEV_LINKS = {"twitch": "https://dev.twitch.tv/console/apps", "kick": "https://kick.com/settings/developer"}
+TWITCH_ID = "https://id.twitch.tv/oauth2"
+# Client ID of the app's own Twitch application, registered with Client Type "Public".
+# A Client ID is not a secret (public clients have none), so it is fine to ship it in the exe.
+TWITCH_PUBLIC_CLIENT_ID = "3o48mwlklz6v0hxd9jqeeoluhp95oe"
 
 DEFAULT_STREAMERS = [
     ("twitch", "vitkuson"), ("twitch", "barbee02"), ("twitch", "lada2much"), ("twitch", "meepochinno"),
@@ -55,6 +62,7 @@ def stream_url(platform, name):
 def load_config():
     cfg = {
         "twitch": {"client_id": "", "client_secret": ""},
+        "twitch_login": {},
         "kick": {"client_id": "", "client_secret": ""},
         "interval": 60,
         "theme": "system",
@@ -79,11 +87,25 @@ def save_config(cfg):
 
 # ---------------------------------------------------------------- APIs
 
-def http_json(url, form=None, headers=None):
-    data = urllib.parse.urlencode(form).encode() if form else None
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
+def http_json(url, form=None, headers=None, body=None, method=None):
+    headers = {"User-Agent": UA, **(headers or {})}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+    elif body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
+        raw = r.read().decode("utf-8")
+        return json.loads(raw) if raw.strip() else {}
+
+
+def http_error_message(e):
+    try:
+        return json.loads(e.read().decode("utf-8")).get("message", "")
+    except Exception:
+        return ""
 
 
 class OAuthApi:
@@ -121,21 +143,323 @@ def cache_bust(url):
     return url + ("&" if "?" in url else "?") + f"t={int(time.time() // 120)}"
 
 
-class TwitchApi(OAuthApi):
-    token_url = "https://id.twitch.tv/oauth2/token"
+class TwitchAuth:
+    """Twitch credentials. Preferred: the user signs in with their Twitch account (Device Code Flow on a
+    public client, so no secret ships with the app). Fallback: the user's own app keys (client credentials)."""
 
-    def headers(self, client_id, token):
-        return {**super().headers(client_id, token), "Client-Id": client_id}
+    def __init__(self, app):
+        self.app = app
+        self.lock = threading.RLock()
+        self._app_token = None
+        self._app_creds = None
+        self.pending = None  # sign-in in progress: {"user_code", "uri", "device_code", ...}
+        self.error = ""
 
-    def check(self, creds, names):
+    @property
+    def login(self):
+        return self.app.cfg.get("twitch_login") or {}
+
+    def mode(self):
+        if self.login.get("access_token"):
+            return "user"
+        c = self.app.cfg["twitch"]
+        if c["client_id"].strip() and c["client_secret"].strip():
+            return "app"
+        return None
+
+    def client_id(self):
+        return self.login["client_id"] if self.mode() == "user" else self.app.cfg["twitch"]["client_id"].strip()
+
+    def token(self):
+        with self.lock:
+            mode = self.mode()
+            if mode == "user":
+                return self.login["access_token"]
+            if mode == "app":
+                c = self.app.cfg["twitch"]
+                creds = (c["client_id"].strip(), c["client_secret"].strip())
+                if creds != self._app_creds or not self._app_token:
+                    d = http_json(f"{TWITCH_ID}/token", form={"client_id": creds[0], "client_secret": creds[1],
+                                                              "grant_type": "client_credentials"})
+                    self._app_creds, self._app_token = creds, d["access_token"]
+                return self._app_token
+            raise RuntimeError("Twitch is not set up")
+
+    def _invalidate(self, failed_token):
+        """Called after a 401: refresh the token unless another thread already did."""
+        with self.lock:
+            if self.mode() == "user":
+                if self.login.get("access_token") == failed_token:
+                    self._refresh_user()
+            elif self._app_token == failed_token:
+                self._app_token = None
+
+    def _refresh_user(self):
+        login = self.login
+        try:
+            d = http_json(f"{TWITCH_ID}/token", form={"client_id": login["client_id"], "grant_type": "refresh_token",
+                                                      "refresh_token": login.get("refresh_token", "")})
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 401):  # refresh token expired or revoked -> user has to sign in again
+                self.app.twitch_signed_out("Your Twitch sign-in expired. Please sign in again.")
+            raise
+        with self.app.lock:
+            self.app.cfg["twitch_login"] = {**login, "access_token": d["access_token"],
+                                            "refresh_token": d.get("refresh_token", login.get("refresh_token"))}
+            save_config(self.app.cfg)
+
+    def request(self, url, method=None, body=None):
+        for attempt in range(2):
+            tok = self.token()
+            try:
+                return http_json(url, method=method, body=body,
+                                 headers={"Authorization": f"Bearer {tok}", "Client-Id": self.client_id(),
+                                          "Accept": "application/json"})
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    self._invalidate(tok)
+                    continue
+                raise
+
+    # ----- sign-in (Device Code Flow)
+    def start_signin(self):
+        if not TWITCH_PUBLIC_CLIENT_ID:
+            return {"ok": False, "error": "Twitch sign-in is not available in this build. Use your own API keys below."}
+        try:
+            d = http_json(f"{TWITCH_ID}/device", form={"client_id": TWITCH_PUBLIC_CLIENT_ID, "scopes": ""})
+        except Exception as e:
+            return {"ok": False, "error": f"Could not reach Twitch ({describe_error(e)})."}
+        with self.lock:
+            self.error = ""
+            self.pending = {"user_code": d["user_code"], "uri": d["verification_uri"], "device_code": d["device_code"],
+                            "interval": max(1, int(d.get("interval", 5))),
+                            "expires": time.time() + int(d.get("expires_in", 1800))}
+            pending = self.pending
+        webbrowser.open(pending["uri"])
+        threading.Thread(target=self._wait_for_signin, args=(pending,), daemon=True).start()
+        return {"ok": True}
+
+    def cancel_signin(self):
+        with self.lock:
+            self.pending = None
+
+    def _wait_for_signin(self, p):
+        form = {"client_id": TWITCH_PUBLIC_CLIENT_ID, "scopes": "", "device_code": p["device_code"],
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}
+        interval = p["interval"]
+        while self.pending is p and not self.app.quitting:
+            time.sleep(interval)
+            if self.pending is not p:
+                return
+            if time.time() > p["expires"]:
+                return self._signin_failed(p, "The sign-in code expired. Please try again.")
+            try:
+                tok = http_json(f"{TWITCH_ID}/token", form=form)
+            except urllib.error.HTTPError as e:
+                msg = http_error_message(e)
+                if msg == "authorization_pending":
+                    continue
+                if msg == "slow_down":
+                    interval += 5
+                    continue
+                return self._signin_failed(p, "Sign-in was cancelled or denied on Twitch." if e.code in (400, 403)
+                                           else f"Twitch sign-in failed (HTTP {e.code}).")
+            except Exception:
+                continue  # network hiccup: keep trying until the code expires
+            try:
+                info = http_json(f"{TWITCH_ID}/validate", headers={"Authorization": f"OAuth {tok['access_token']}"})
+            except Exception as e:
+                return self._signin_failed(p, f"Could not read your Twitch account ({describe_error(e)}).")
+            with self.lock:
+                if self.pending is not p:
+                    return
+                self.pending = None
+            self.app.twitch_signed_in({"client_id": TWITCH_PUBLIC_CLIENT_ID, "access_token": tok["access_token"],
+                                       "refresh_token": tok.get("refresh_token", ""), "login": info.get("login", ""),
+                                       "user_id": info.get("user_id", "")})
+            return
+
+    def _signin_failed(self, p, msg):
+        with self.lock:
+            if self.pending is p:
+                self.pending, self.error = None, msg
+        self.app.push_state()
+
+    def revoke(self, login):
+        try:
+            http_json(f"{TWITCH_ID}/revoke", form={"client_id": login["client_id"], "token": login["access_token"]})
+        except Exception:
+            pass
+
+    def info(self):
+        with self.lock:
+            p = self.pending
+            return {"mode": self.mode(), "login": self.login.get("login", ""), "available": bool(TWITCH_PUBLIC_CLIENT_ID),
+                    "pending": {"user_code": p["user_code"], "uri": p["uri"]} if p else None, "error": self.error}
+
+
+class TwitchEventSub:
+    """Instant "went live" alerts over Twitch EventSub WebSockets (needs a signed-in user).
+    Polling keeps running alongside it for viewer counts, previews and offline detection."""
+    URL = "wss://eventsub.wss.twitch.tv/ws"
+    SUBS_URL = "https://api.twitch.tv/helix/eventsub/subscriptions"
+
+    def __init__(self, app):
+        self.app = app
+        self.wake = threading.Event()
+        self.ws = None
+        self.session_id = None
+        self.subs = {}       # broadcaster user_id -> subscription id
+        self.ids = {}        # login -> user_id
+        self.limit_hit = False
+        self.connected = False
+        self.sync_lock = threading.Lock()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def restart(self):
+        """Drop the connection (e.g. after sign-in / sign-out); the loop reconnects if still signed in."""
+        ws = self.ws
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self.wake.set()
+
+    def _run(self):
+        backoff = 5
+        while not self.app.quitting:
+            if self.app.twitch_auth.mode() != "user":
+                self.wake.wait(3600)
+                self.wake.clear()
+                continue
+            started = time.time()
+            try:
+                self._session()
+            except Exception:
+                pass
+            self.connected, self.session_id, self.subs, self.limit_hit = False, None, {}, False
+            self.app.push_state()
+            if self.app.quitting:
+                return
+            backoff = 5 if time.time() - started > 120 else min(backoff * 2, 300)
+            self.wake.wait(backoff)
+            self.wake.clear()
+
+    def _session(self):
+        ws =websocket.create_connection(self.URL, timeout=15)
+        self.ws = ws
+        keepalive = 10
+        try:
+            while not self.app.quitting and self.app.twitch_auth.mode() == "user":
+                ws.settimeout(keepalive + 10)
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    return  # no keepalive from Twitch -> reconnect
+                if not raw:
+                    return
+                msg = json.loads(raw)
+                kind = msg.get("metadata", {}).get("message_type")
+                payload = msg.get("payload", {})
+                if kind == "session_welcome":
+                    sess = payload["session"]
+                    keepalive = int(sess.get("keepalive_timeout_seconds") or 10)
+                    if self.session_id is None:  # fresh connection (not a reconnect hand-over)
+                        self.session_id = sess["id"]
+                        self.connected = True
+                        threading.Thread(target=self.sync, daemon=True).start()
+                elif kind == "session_reconnect":
+                    # Twitch moves us to another server; subscriptions carry over to the new connection
+                    new = websocket.create_connection(payload["session"]["reconnect_url"], timeout=15)
+                    old, ws, self.ws = ws, new, new
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
+                elif kind == "notification" and payload.get("subscription", {}).get("type") == "stream.online":
+                    ev = payload.get("event", {})
+                    threading.Thread(target=self.app.on_twitch_online, daemon=True,
+                                     args=(ev.get("broadcaster_user_login", ""), ev.get("broadcaster_user_id", ""),
+                                           ev.get("started_at", ""))).start()
+                elif kind == "revocation":
+                    sub = payload.get("subscription", {})
+                    uid = sub.get("condition", {}).get("broadcaster_user_id")
+                    if uid and self.subs.get(uid) == sub.get("id"):
+                        self.subs.pop(uid, None)
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+    def sync(self):
+        """Make the subscriptions match the Twitch streamers that have notifications on."""
+        with self.sync_lock:
+            sid = self.session_id
+            if not sid or self.app.twitch_auth.mode() != "user":
+                return
+            auth = self.app.twitch_auth
+            with self.app.lock:
+                wanted = [s["name"] for s in self.app.cfg["streamers"] if s["platform"] == "twitch" and s["notify"]]
+            try:
+                missing = [n for n in wanted if n not in self.ids]
+                for i in range(0, len(missing), 100):
+                    q = "&".join("login=" + urllib.parse.quote(n) for n in missing[i:i + 100])
+                    for u in auth.request("https://api.twitch.tv/helix/users?" + q)["data"]:
+                        self.ids[u["login"].lower()] = u["id"]
+            except Exception:
+                pass
+            wanted_ids = {self.ids[n] for n in wanted if n in self.ids}
+            for uid in [u for u in self.subs if u not in wanted_ids]:
+                try:
+                    auth.request(f"{self.SUBS_URL}?id={self.subs[uid]}", method="DELETE")
+                except Exception:
+                    pass
+                self.subs.pop(uid, None)
+                self.limit_hit = False
+            for uid in wanted_ids - set(self.subs):
+                if self.session_id != sid:
+                    return
+                try:
+                    r = auth.request(self.SUBS_URL, method="POST", body={
+                        "type": "stream.online", "version": "1", "condition": {"broadcaster_user_id": uid},
+                        "transport": {"method": "websocket", "session_id": sid}})
+                    self.subs[uid] = r["data"][0]["id"]
+                except urllib.error.HTTPError as e:
+                    if e.code in (429, 400, 403):  # per-user subscription limit reached: polling covers the rest
+                        self.limit_hit = True
+                        break
+                except Exception:
+                    pass
+        self.app.push_state()
+
+    def info(self):
+        with self.app.lock:
+            wanted = sum(1 for s in self.app.cfg["streamers"] if s["platform"] == "twitch" and s["notify"])
+        return {"connected": self.connected, "instant": len(self.subs), "wanted": wanted, "limit": self.limit_hit}
+
+
+class TwitchApi:
+    def __init__(self, auth):
+        self.auth = auth
+
+    def channel_info(self, user_id):
+        d = self.auth.request("https://api.twitch.tv/helix/channels?broadcaster_id=" + urllib.parse.quote(user_id))
+        return (d.get("data") or [{}])[0]
+
+    def check(self, names):
         out = {}
         for i in range(0, len(names), 100):
             chunk = names[i:i + 100]
             q = "&".join("login=" + urllib.parse.quote(n) for n in chunk)
-            users = {u["login"].lower(): u for u in self.get(creds, "https://api.twitch.tv/helix/users?" + q)["data"]}
+            users = {u["login"].lower(): u for u in self.auth.request("https://api.twitch.tv/helix/users?" + q)["data"]}
             q = "&".join("user_login=" + urllib.parse.quote(n) for n in chunk)
             live = {s["user_login"].lower(): s
-                    for s in self.get(creds, "https://api.twitch.tv/helix/streams?first=100&" + q)["data"]}
+                    for s in self.auth.request("https://api.twitch.tv/helix/streams?first=100&" + q)["data"]}
             for n in chunk:
                 u = users.get(n)
                 if not u:
@@ -328,6 +652,22 @@ class JsApi:
     def refresh(self):
         self._app.wake.set()
 
+    def twitch_signin(self):
+        r = self._app.twitch_auth.start_signin()
+        self._app.push_state()
+        return r
+
+    def twitch_cancel_signin(self):
+        self._app.twitch_auth.cancel_signin()
+        self._app.push_state()
+
+    def twitch_open_activate(self):
+        p = self._app.twitch_auth.pending
+        webbrowser.open(p["uri"] if p else "https://www.twitch.tv/activate")
+
+    def twitch_signout(self):
+        self._app.twitch_signed_out()
+
     def get_settings(self):
         return self._app.get_settings()
 
@@ -372,7 +712,9 @@ class App:
         self.flyout_visible = False
         self.flyout_hidden_at = 0.0
         self.tray = None
-        self.twitch, self.kick = TwitchApi(), KickApi()
+        self.twitch_auth = TwitchAuth(self)
+        self.twitch, self.kick = TwitchApi(self.twitch_auth), KickApi()
+        self.eventsub = TwitchEventSub(self)
 
         api = JsApi(self)
         dark = self.effective_dark()
@@ -387,14 +729,70 @@ class App:
         self.main.events.closing += self.on_main_closing
 
     # ----- state
+    def kick_ready(self):
+        return bool(self.cfg["kick"]["client_id"] and self.cfg["kick"]["client_secret"])
+
     def has_any_keys(self):
-        return any(self.cfg[p]["client_id"] and self.cfg[p]["client_secret"] for p in ("twitch", "kick"))
+        return bool(self.twitch_auth.mode()) or self.kick_ready()
+
+    # ----- Twitch sign-in
+    def twitch_signed_in(self, login):
+        with self.lock:
+            self.cfg["twitch_login"] = login
+            save_config(self.cfg)
+        self.eventsub.restart()
+        self.push_state()
+        self.wake.set()
+
+    def twitch_signed_out(self, error=""):
+        with self.lock:
+            login = self.cfg.get("twitch_login") or {}
+            self.cfg["twitch_login"] = {}
+            save_config(self.cfg)
+        self.twitch_auth.error = error
+        if login.get("access_token") and not error:
+            threading.Thread(target=self.twitch_auth.revoke, args=(login,), daemon=True).start()
+        self.eventsub.restart()
+        self.push_state()
+        self.wake.set()
+
+    def on_twitch_online(self, login, user_id, started):
+        """EventSub says a stream just started: alert right away instead of waiting for the next poll."""
+        key = ("twitch", (login or "").lower())
+        with self.lock:
+            entry = next((s for s in self.cfg["streamers"] if (s["platform"], s["name"]) == key), None)
+            prev = self.status.get(key, {})
+        if not entry or prev.get("state") == "live":
+            return
+        try:
+            ch = self.twitch.channel_info(user_id)
+        except Exception:
+            ch = {}
+        st = {"display": prev.get("display") or ch.get("broadcaster_name") or login, "avatar": prev.get("avatar", ""),
+              "state": "live", "title": ch.get("title", ""), "game": ch.get("game_name", ""), "viewers": 0,
+              "started": started, "thumb": "", "pending_until": time.time() + 300}
+        with self.lock:
+            if self.status.get(key, {}).get("state") == "live":
+                return
+            self.status[key] = st
+            notify = entry["notify"]
+        if notify:
+            self.notify(key, st)
+        self.push_state()
+        t = threading.Timer(90, self.wake.set)  # fetch viewers + preview once Twitch lists the stream
+        t.daemon = True
+        t.start()
 
     def effective_dark(self):
         t = self.cfg.get("theme", "system")
         return t == "dark" or (t == "system" and system_uses_dark())
 
+    def twitch_info(self):
+        # Must not be called while holding self.lock (TwitchAuth takes its own lock first, then self.lock)
+        return {**self.twitch_auth.info(), "eventsub": self.eventsub.info()}
+
     def state(self):
+        twitch = self.twitch_info()
         with self.lock:
             items = []
             for s in self.cfg["streamers"]:
@@ -402,7 +800,8 @@ class App:
                 items.append({**st, "platform": s["platform"], "name": s["name"], "notify": s["notify"],
                               "url": stream_url(s["platform"], s["name"])})
             return {"streamers": items, "theme": self.cfg.get("theme", "system"),
-                    "last_check": self.last_check, "has_keys": self.has_any_keys()}
+                    "last_check": self.last_check, "has_keys": self.has_any_keys(),
+                    "twitch_auth": twitch}
 
     def push_state(self):
         payload = json.dumps(self.state())
@@ -438,6 +837,7 @@ class App:
             save_config(self.cfg)
         self.push_state()
         self.wake.set()
+        self.sync_eventsub(plat)
         return {"ok": True, "platform": plat, "name": name}
 
     def remove_streamer(self, platform, name):
@@ -447,6 +847,7 @@ class App:
             self.status.pop((platform, name), None)
             save_config(self.cfg)
         self.push_state()
+        self.sync_eventsub(platform)
 
     def toggle_notify(self, platform, name):
         with self.lock:
@@ -455,11 +856,17 @@ class App:
                     s["notify"] = not s["notify"]
             save_config(self.cfg)
         self.push_state()
+        self.sync_eventsub(platform)
+
+    def sync_eventsub(self, platform):
+        if platform == "twitch":
+            threading.Thread(target=self.eventsub.sync, daemon=True).start()
 
     # ----- settings
     def get_settings(self):
+        twitch = self.twitch_info()
         with self.lock:
-            return {"twitch": dict(self.cfg["twitch"]), "kick": dict(self.cfg["kick"]),
+            return {"twitch": dict(self.cfg["twitch"]), "kick": dict(self.cfg["kick"]), "twitch_auth": twitch,
                     "interval": self.cfg["interval"], "theme": self.cfg.get("theme", "system"),
                     "startup": startup_enabled()}
 
@@ -507,15 +914,17 @@ class App:
                 creds = {p: dict(self.cfg[p]) for p in ("twitch", "kick")}
                 interval = self.cfg["interval"]
             results = {}
-            for plat, api in (("twitch", self.twitch), ("kick", self.kick)):
+            checks = (("twitch", self.twitch_auth.mode(), lambda names: self.twitch.check(names)),
+                      ("kick", self.kick_ready(), lambda names: self.kick.check(creds["kick"], names)))
+            for plat, ready, check in checks:
                 names = [s["name"] for s in streamers if s["platform"] == plat]
                 if not names:
                     continue
-                if not (creds[plat]["client_id"] and creds[plat]["client_secret"]):
+                if not ready:
                     results.update({(plat, n): {"state": "nokeys"} for n in names})
                     continue
                 try:
-                    results.update({(plat, n): st for n, st in api.check(creds[plat], names).items()})
+                    results.update({(plat, n): st for n, st in check(names).items()})
                 except Exception as e:
                     err = describe_error(e)
                     results.update({(plat, n): {"state": "error", "error": err} for n in names})
@@ -534,6 +943,9 @@ class App:
                 # On a temporary error keep the last known state, so it doesn't re-trigger "went live" alerts
                 if st["state"] == "error" and prev.get("state") in ("live", "offline"):
                     st = {**prev, "stale": st.get("error")}
+                # EventSub reported "live" but Helix doesn't list the stream yet: trust EventSub for a few minutes
+                if st["state"] == "offline" and prev.get("pending_until", 0) > time.time():
+                    st = prev
                 if st["state"] in ("live", "offline") and not st.get("avatar") and prev.get("avatar"):
                     st["avatar"] = prev["avatar"]
                 if st["state"] == "live" and prev.get("state") != "live" and notify[key]:
@@ -688,6 +1100,7 @@ class App:
     def on_start(self):
         threading.Thread(target=self.poll_loop, daemon=True).start()
         threading.Thread(target=self.run_tray, daemon=True).start()
+        self.eventsub.start()
         self.flyout.events.loaded += lambda: self.prepare_flyout()
 
     def run(self):

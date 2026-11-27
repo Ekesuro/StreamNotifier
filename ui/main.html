@@ -141,6 +141,19 @@
   .check { display: flex; align-items: center; gap: 10px; margin-top: 16px; cursor: pointer; }
   .check input { width: 17px; height: 17px; accent-color: var(--accent); }
   .divider { border: 0; border-top: 1px solid var(--border); margin: 20px 0 4px; }
+  .auth { margin-top: 10px; font-size: 13.5px; }
+  .auth .row { flex-wrap: wrap; gap: 10px; }
+  .auth .muted { color: var(--muted); font-size: 12.5px; margin-top: 6px; line-height: 1.45; }
+  .auth .ok { display: inline-flex; align-items: center; gap: 8px; }
+  .auth .code {
+    font: 700 22px/1 ui-monospace, Consolas, monospace; letter-spacing: 3px; padding: 10px 14px; border-radius: 8px;
+    background: var(--surface-2); border: 1px dashed var(--border); user-select: all;
+  }
+  .btn.twitch { background: #9146ff; border-color: #9146ff; color: #fff; }
+  .btn.twitch:hover { background: #7c2fff; }
+  details { margin-top: 12px; }
+  details summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+  details summary:hover { color: var(--text); }
 
   .toast {
     position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%) translateY(20px); opacity: 0;
@@ -214,13 +227,18 @@
     <label class="check"><input type="checkbox" id="startup"> Start with Windows (opens quietly in the tray)</label>
 
     <hr class="divider">
-    <label class="field">API keys</label>
+    <label class="field">Accounts</label>
     <div class="keys">
-      <div class="keys-head"><span class="plat twitch">Twitch</span><a data-dev="twitch">Get keys at dev.twitch.tv ↗</a></div>
-      <label class="field">Client ID</label>
-      <input class="input" id="twitchId" spellcheck="false" autocomplete="off">
-      <label class="field">Client Secret</label>
-      <input class="input" id="twitchSecret" type="password" spellcheck="false" autocomplete="off">
+      <div class="keys-head"><span class="plat twitch">Twitch</span></div>
+      <div id="twAuth"></div>
+      <details id="twAdvanced">
+        <summary>Advanced: use your own Twitch API keys instead</summary>
+        <div class="keys-head"><span class="hint" style="margin:0">Only used when you are not signed in.</span><a data-dev="twitch">Get keys at dev.twitch.tv ↗</a></div>
+        <label class="field">Client ID</label>
+        <input class="input" id="twitchId" spellcheck="false" autocomplete="off">
+        <label class="field">Client Secret</label>
+        <input class="input" id="twitchSecret" type="password" spellcheck="false" autocomplete="off">
+      </details>
     </div>
     <div class="keys">
       <div class="keys-head"><span class="plat kick">Kick</span><a data-dev="kick">Get keys at kick.com ↗</a></div>
@@ -307,7 +325,7 @@ function miniCard(s) {
     offline: ["Offline", "", ""],
     checking: ["Checking…", "unknown", ""],
     notfound: ["Channel not found", "unknown", "problem"],
-    nokeys: ["Add API keys in Settings", "unknown", "problem"],
+    nokeys: [s.platform === "twitch" ? "Sign in to Twitch in Settings" : "Add Kick API keys in Settings", "unknown", "problem"],
     error: [s.error || "Error", "unknown", "problem"],
   };
   const [text, dotCls, cls] = map[s.state] || map.checking;
@@ -335,7 +353,7 @@ function render() {
 
   let html = "";
   if (!state.has_keys) {
-    html += `<div class="banner">${icon("gear")}<div><b>Add your API keys</b> so the app can check who is live.</div>
+    html += `<div class="banner">${icon("gear")}<div><b>Sign in with Twitch</b> (or add Kick keys) so the app can check who is live.</div>
              <div class="spacer"></div><button class="btn primary" onclick="openSettings()">Open settings</button></div>`;
   }
   if (!list.length) {
@@ -354,9 +372,15 @@ function render() {
 }
 
 window.onState = s => {
+  const wasPending = state.twitch_auth?.pending, wasMode = state.twitch_auth?.mode;
   state = s;
   applyTheme(s.theme);
   render();
+  renderTwitchAuth(s.twitch_auth);
+  if (wasPending && s.twitch_auth?.mode === "user" && wasMode !== "user") {
+    toast(`Signed in as ${s.twitch_auth.login}`);
+    $("#twAdvanced").open = false;
+  }
   $("#refreshBtn").classList.remove("spin");
 };
 setInterval(render, 60000); // keep uptime fresh
@@ -483,10 +507,49 @@ window.openSettings = async (firstRun) => {
   $("#kickId").value = s.kick.client_id; $("#kickSecret").value = s.kick.client_secret;
   $("#settingsError").textContent = "";
   $("#settingsHint").textContent = firstRun
-    ? "Welcome! Add your Twitch and Kick API keys so the app can check who is live."
-    : "Appearance, checking and API keys.";
+    ? "Welcome! Sign in with Twitch so the app can check who is live. Following Kick streamers? Add Kick API keys too."
+    : "Appearance, checking and accounts.";
+  renderTwitchAuth(s.twitch_auth);
+  $("#twAdvanced").open = !s.twitch_auth?.available || (!!s.twitch.client_id && s.twitch_auth?.mode !== "user");
   openModal("#settingsModal");
 };
+
+// Twitch sign-in block (updates live while the settings window is open)
+function renderTwitchAuth(a) {
+  if (!a) return;
+  let html;
+  if (a.mode === "user") {
+    const es = a.eventsub || {};
+    const instant = !es.connected ? "Connecting instant alerts…"
+      : es.wanted === 0 ? "Instant alerts are ready."
+      : es.instant >= es.wanted ? "Instant go-live alerts are on."
+      : `Instant alerts for ${es.instant} of ${es.wanted} channels${es.limit ? " (Twitch limit) - the rest are checked every minute" : "…"}.`;
+    html = `<div class="row"><span class="ok"><span class="dot live"></span>Signed in as <b>${esc(a.login)}</b></span>
+              <div class="spacer"></div><button class="btn" id="twSignOut">Sign out</button></div>
+            <div class="muted">${esc(instant)}</div>`;
+  } else if (a.pending) {
+    html = `<div>On the Twitch page that just opened, check that this code matches and click <b>Authorize</b>:</div>
+            <div class="row" style="margin-top:10px"><span class="code">${esc(a.pending.user_code)}</span>
+              <div class="spacer"></div><button class="btn" id="twReopen">Open page again</button><button class="btn" id="twCancel">Cancel</button></div>
+            <div class="muted">Waiting for Twitch…</div>`;
+  } else if (a.available) {
+    html = `<div class="row"><button class="btn twitch" id="twSignIn">Sign in with Twitch</button></div>
+            <div class="muted">${a.mode === "app" ? "Currently using your own API keys. " : ""}No API keys needed - the app only reads who is live and never posts anything.</div>`;
+  } else {
+    html = `<div class="muted">Enter your Twitch app keys below.</div>`;
+  }
+  if (a.error) html += `<div class="error">${esc(a.error)}</div>`;
+  $("#twAuth").innerHTML = `<div class="auth">${html}</div>`;
+  const on = (id, fn) => { const b = document.getElementById(id); if (b) b.onclick = fn; };
+  on("twSignIn", async () => {
+    $("#twSignIn").disabled = true;
+    const r = await api().twitch_signin();
+    if (!r.ok) { $("#twSignIn").disabled = false; $("#twAuth .auth").insertAdjacentHTML("beforeend", `<div class="error">${esc(r.error)}</div>`); }
+  });
+  on("twReopen", () => api().twitch_open_activate());
+  on("twCancel", () => api().twitch_cancel_signin());
+  on("twSignOut", () => { api().twitch_signout(); toast("Signed out of Twitch"); });
+}
 $("#themeSeg").addEventListener("click", () => applyTheme(segValue($("#themeSeg"))));  // live preview
 document.querySelectorAll("#settingsModal [data-close]").forEach(b => b.addEventListener("click", () => {
   if (themeBeforeSettings) applyTheme(themeBeforeSettings);
