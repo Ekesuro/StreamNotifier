@@ -16,6 +16,7 @@ const ICONS = {
   window: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/>',
   eye: '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
   pin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>',
 };
 const icon = (name, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24">${ICONS[name]}</svg>`;
@@ -37,6 +38,39 @@ function fmtUptime(iso) {
   const mins = Math.max(0, Math.floor((Date.now() - t) / 60000));
   const h = Math.floor(mins / 60), m = mins % 60;
   return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+// ---------- Twitch schedule
+let CLOCK24 = true;  // follows the Windows time format, sent by Python as state.clock24
+
+function fmtTime(d) {
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: !CLOCK24 });
+}
+function fmtDay(d) {
+  const day0 = x => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const diff = Math.round((day0(d) - day0(new Date())) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Tomorrow";
+  if (diff > 1 && diff < 7) return d.toLocaleDateString("en-GB", { weekday: "short" });
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+// The next scheduled stream (or a current break), or null when there's nothing to show
+function nextStream(s) {
+  const now = Date.now();
+  const v = s.vacation;
+  if (v && Date.parse(v.start) <= now && Date.parse(v.end) > now) return { vacation: true, end: v.end };
+  const seg = (s.schedule || []).find(x => Date.parse(x.end || x.start) > now);
+  return seg ? { ...seg, ongoing: Date.parse(seg.start) <= now } : null;
+}
+// "Today 19:00", "Fri 19:00", "Break until 5 Dec"
+function scheduleWhen(n) {
+  if (n.vacation) return `Break until ${new Date(n.end).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}`;
+  const d = new Date(n.start);
+  return n.ongoing ? `Scheduled ${fmtTime(d)}` : `${fmtDay(d)} ${fmtTime(d)}`;
+}
+function scheduleTip(n) {
+  if (n.vacation) return "Taking a break from streaming";
+  return [n.title, n.game].filter(Boolean).join(" · ");
 }
 
 function sortStreamers(list) {

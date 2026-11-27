@@ -5,7 +5,8 @@ A small Windows tray app that notifies you when your favorite **Twitch** and **K
 - Card view of live streamers with preview image, title, game, viewers and uptime
 - Windows notification when someone goes live, with a **Watch** button (instant for Twitch)
 - Turn notifications on or off per streamer
-- Quick view: left-click the tray icon to see who is live at a glance
+- Shows the next scheduled stream (or a break) for Twitch streamers who use the Twitch schedule
+- Quick view: left-click the tray icon to see who is live at a glance; drag it anywhere, or pin it on top
 - Light, dark, or follow Windows theme
 - Optional start with Windows (runs quietly in the tray)
 
@@ -38,6 +39,7 @@ With keys, alerts come from regular checks (every minute by default) instead of 
 3. Copy the **Client ID** and **Client Secret**.
 
 Your sign-in, keys and streamer list are stored locally in `%APPDATA%\StreamNotifier\config.json`.
+If something goes wrong, `%APPDATA%\StreamNotifier\log.txt` records sign-in and instant-alert events (never tokens).
 
 ## Running from source
 

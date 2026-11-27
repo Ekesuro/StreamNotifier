@@ -25,6 +25,7 @@
   .item:not(.live) .name { color: var(--muted); }
   .item .meta { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 8px; flex: none; }
   .item .viewers { color: var(--text); font-weight: 600; }
+  .item .when { color: var(--text); opacity: .75; white-space: nowrap; }
   .item .plat { font-size: 10.5px; opacity: .9; }
   .muted-bell { color: var(--muted); opacity: .6; }
   .muted-bell svg { width: 13px; height: 13px; }
@@ -85,6 +86,7 @@ function render() {
   $("#list").innerHTML = list.length ? list.map(s => {
     const isLive = s.state === "live";
     const dot = isLive ? "live" : s.state === "offline" ? "" : "unknown";
+    const nx = s.state === "offline" ? nextStream(s) : null;
     return `<div class="item ${isLive ? "live" : ""}" data-p="${esc(s.platform)}" data-n="${esc(s.name)}"
                  title="${esc(isLive ? (s.title || "") : s.state === "offline" ? "Offline" : (s.error || s.state))}">
       <span class="dot ${dot}"></span>
@@ -92,6 +94,7 @@ function render() {
       <span class="meta">
         ${s.notify ? "" : `<span class="muted-bell" title="Notifications muted">${icon("bellOff")}</span>`}
         ${isLive ? `<span class="viewers">${fmtViewers(s.viewers)}</span>` : ""}
+        ${nx ? `<span class="when" title="${esc(scheduleTip(nx))}">${esc(scheduleWhen(nx))}</span>` : ""}
         <span class="plat ${s.platform}">${PLATFORM[s.platform]}</span>
       </span>
     </div>`;
@@ -107,7 +110,7 @@ function reportSize() {
   });
 }
 
-window.onState = s => { state = s; applyTheme(s.theme); render(); $("#refreshBtn").classList.remove("spin"); };
+window.onState = s => { state = s; CLOCK24 = s.clock24 ?? true; applyTheme(s.theme); render(); $("#refreshBtn").classList.remove("spin"); };
 
 $("#list").addEventListener("click", e => {
   const it = e.target.closest(".item");

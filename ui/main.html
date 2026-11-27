@@ -141,6 +141,9 @@
   .check { display: flex; align-items: center; gap: 10px; margin-top: 16px; cursor: pointer; }
   .check input { width: 17px; height: 17px; accent-color: var(--accent); }
   .divider { border: 0; border-top: 1px solid var(--border); margin: 20px 0 4px; }
+  .mini .sched { display: flex; align-items: center; gap: 5px; margin-top: 3px; font-size: 12px; white-space: nowrap; min-width: 0; }
+  .mini .sched span { overflow: hidden; text-overflow: ellipsis; }
+  .mini .sched svg { flex: none; width: 12px; height: 12px; opacity: .75; }
   .auth { margin-top: 10px; font-size: 13.5px; }
   .auth .row { flex-wrap: wrap; gap: 10px; }
   .auth .muted { color: var(--muted); font-size: 12.5px; margin-top: 6px; line-height: 1.45; }
@@ -321,6 +324,7 @@ function bellBtn(s) {
 }
 
 function miniCard(s) {
+  const nx = s.state === "offline" ? nextStream(s) : null;
   const map = {
     offline: ["Offline", "", ""],
     checking: ["Checking…", "unknown", ""],
@@ -335,6 +339,7 @@ function miniCard(s) {
     <div class="who">
       <div class="name">${esc(s.display || s.name)}</div>
       <div class="status" title="${esc(text)}"><span class="dot ${dotCls}"></span><span class="plat ${s.platform}">${PLATFORM[s.platform]}</span>·<span class="txt">${esc(text)}</span></div>
+      ${nx ? `<div class="sched" title="${esc(`${nx.vacation ? "" : "Next stream: "}${scheduleWhen(nx)}\n${scheduleTip(nx)}`.trim())}">${icon("calendar")}<span>${esc(scheduleWhen(nx))}</span></div>` : ""}
     </div>
     ${bellBtn(s)}
     <button class="icon-btn" data-act="menu" title="More">${icon("more")}</button>
@@ -372,6 +377,7 @@ function render() {
 }
 
 window.onState = s => {
+  CLOCK24 = s.clock24 ?? true;
   const wasPending = state.twitch_auth?.pending, wasMode = state.twitch_auth?.mode;
   state = s;
   applyTheme(s.theme);

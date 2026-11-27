@@ -47,10 +47,22 @@ TWITCH_ID = "https://id.twitch.tv/oauth2"
 # A Client ID is not a secret (public clients have none), so it is fine to ship it in the exe.
 TWITCH_PUBLIC_CLIENT_ID = "3o48mwlklz6v0hxd9jqeeoluhp95oe"
 
-DEFAULT_STREAMERS = [
-    ("twitch", "vitkuson"), ("twitch", "barbee02"), ("twitch", "lada2much"), ("twitch", "meepochinno"),
-    ("twitch", "lolsweetcz"), ("twitch", "wesperfey"), ("kick", "nezbedaaa"), ("kick", "snugglyvr"),
-]
+
+LOG_PATH = os.path.join(DATA_DIR, "log.txt")
+_log_lock = threading.Lock()
+
+
+def log(msg):
+    """Small diagnostic log (sign-in, token renewal, instant alerts). Never contains tokens."""
+    try:
+        with _log_lock:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 256 * 1024:
+                os.replace(LOG_PATH, LOG_PATH + ".old")
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+    except OSError:
+        pass
 
 
 def stream_url(platform, name):
@@ -63,11 +75,12 @@ def load_config():
     cfg = {
         "twitch": {"client_id": "", "client_secret": ""},
         "twitch_login": {},
+        "twitch_auth_error": "",  # why the last Twitch sign-in ended (shown in Settings until signing in again)
         "kick": {"client_id": "", "client_secret": ""},
         "interval": 60,
         "theme": "system",
         "flyout": {"pos": None, "pinned": False},  # quick view: saved top-left [x, y] in screen pixels
-        "streamers": [{"platform": p, "name": n, "notify": True} for p, n in DEFAULT_STREAMERS],
+        "streamers": [],  # new users start empty and add their own
     }
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
@@ -197,13 +210,28 @@ class TwitchAuth:
 
     def _refresh_user(self):
         login = self.login
+        # Twitch refresh tokens are single-use. If another copy of the app (or an older run) already renewed,
+        # the newer tokens are in config.json: use those instead of burning/failing with our stale one.
+        disk = load_config().get("twitch_login") or {}
+        if (disk.get("user_id") == login.get("user_id") and disk.get("refresh_token")
+                and disk.get("refresh_token") != login.get("refresh_token")):
+            with self.app.lock:
+                self.app.cfg["twitch_login"] = disk
+            log("twitch: picked up tokens renewed by another copy of the app")
+            return
         try:
             d = http_json(f"{TWITCH_ID}/token", form={"client_id": login["client_id"], "grant_type": "refresh_token",
                                                       "refresh_token": login.get("refresh_token", "")})
         except urllib.error.HTTPError as e:
+            msg = http_error_message(e)
+            log(f"twitch: token renewal failed: HTTP {e.code} {msg!r}")
             if e.code in (400, 401):  # refresh token expired or revoked -> user has to sign in again
-                self.app.twitch_signed_out("Your Twitch sign-in expired. Please sign in again.")
+                self.app.twitch_signed_out(f"Your Twitch sign-in expired ({msg or e.code}). Please sign in again.")
             raise
+        except Exception as e:
+            log(f"twitch: token renewal failed: {e!r}")
+            raise
+        log(f"twitch: token renewed (expires in {d.get('expires_in')} s, new refresh token: {bool(d.get('refresh_token'))})")
         with self.app.lock:
             self.app.cfg["twitch_login"] = {**login, "access_token": d["access_token"],
                                             "refresh_token": d.get("refresh_token", login.get("refresh_token"))}
@@ -218,6 +246,7 @@ class TwitchAuth:
                                           "Accept": "application/json"})
             except urllib.error.HTTPError as e:
                 if e.code == 401 and attempt == 0:
+                    log(f"twitch: 401 from {url.split('?')[0]} ({self.mode()} token) - renewing")
                     self._invalidate(tok)
                     continue
                 raise
@@ -231,7 +260,7 @@ class TwitchAuth:
         except Exception as e:
             return {"ok": False, "error": f"Could not reach Twitch ({describe_error(e)})."}
         with self.lock:
-            self.error = ""
+            self.error = self.app.cfg["twitch_auth_error"] = ""
             self.pending = {"user_code": d["user_code"], "uri": d["verification_uri"], "device_code": d["device_code"],
                             "interval": max(1, int(d.get("interval", 5))),
                             "expires": time.time() + int(d.get("expires_in", 1800))}
@@ -275,6 +304,8 @@ class TwitchAuth:
                 if self.pending is not p:
                     return
                 self.pending = None
+            log(f"twitch: signed in as {info.get('login')} (token expires in {tok.get('expires_in')} s, "
+                f"refresh token: {bool(tok.get('refresh_token'))})")
             self.app.twitch_signed_in({"client_id": TWITCH_PUBLIC_CLIENT_ID, "access_token": tok["access_token"],
                                        "refresh_token": tok.get("refresh_token", ""), "login": info.get("login", ""),
                                        "user_id": info.get("user_id", "")})
@@ -296,7 +327,8 @@ class TwitchAuth:
         with self.lock:
             p = self.pending
             return {"mode": self.mode(), "login": self.login.get("login", ""), "available": bool(TWITCH_PUBLIC_CLIENT_ID),
-                    "pending": {"user_code": p["user_code"], "uri": p["uri"]} if p else None, "error": self.error}
+                    "pending": {"user_code": p["user_code"], "uri": p["uri"]} if p else None,
+                    "error": self.error or self.app.cfg.get("twitch_auth_error", "")}
 
 
 class TwitchEventSub:
@@ -339,8 +371,8 @@ class TwitchEventSub:
             started = time.time()
             try:
                 self._session()
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"eventsub: connection error {e!r}")
             self.connected, self.session_id, self.subs, self.limit_hit = False, None, {}, False
             self.app.push_state()
             if self.app.quitting:
@@ -431,11 +463,13 @@ class TwitchEventSub:
                         "transport": {"method": "websocket", "session_id": sid}})
                     self.subs[uid] = r["data"][0]["id"]
                 except urllib.error.HTTPError as e:
+                    log(f"eventsub: subscribe failed HTTP {e.code} {http_error_message(e)!r}")
                     if e.code in (429, 400, 403):  # per-user subscription limit reached: polling covers the rest
                         self.limit_hit = True
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"eventsub: subscribe failed {e!r}")
+            log(f"eventsub: {len(self.subs)} of {len(wanted)} channels subscribed")
         self.app.push_state()
 
     def info(self):
@@ -447,6 +481,22 @@ class TwitchEventSub:
 class TwitchApi:
     def __init__(self, auth):
         self.auth = auth
+        self.user_ids = {}  # login -> broadcaster id (filled by check)
+
+    def schedule(self, user_id):
+        """Upcoming (non-cancelled) schedule segments and vacation; empty if the streamer has no schedule."""
+        try:
+            d = self.auth.request("https://api.twitch.tv/helix/schedule?first=5&broadcaster_id="
+                                  + urllib.parse.quote(user_id))["data"]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:  # "schedule was not found" / "segments were not found"
+                return {"segments": [], "vacation": None}
+            raise
+        segs = [{"start": s["start_time"], "end": s.get("end_time") or "", "title": s.get("title") or "",
+                 "game": (s.get("category") or {}).get("name") or ""}
+                for s in d.get("segments") or [] if not s.get("canceled_until")]
+        vac = d.get("vacation")
+        return {"segments": segs[:3], "vacation": {"start": vac["start_time"], "end": vac["end_time"]} if vac else None}
 
     def channel_info(self, user_id):
         d = self.auth.request("https://api.twitch.tv/helix/channels?broadcaster_id=" + urllib.parse.quote(user_id))
@@ -466,6 +516,7 @@ class TwitchApi:
                 if not u:
                     out[n] = {"state": "notfound"}
                     continue
+                self.user_ids[n] = u["id"]
                 base = {"display": u["display_name"], "avatar": u.get("profile_image_url", "")}
                 s = live.get(n)
                 if s:
@@ -611,6 +662,15 @@ def system_uses_dark():
         return False
 
 
+def system_uses_24h():
+    """Follow the Windows regional time format (e.g. "H:mm" vs "h:mm tt")."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International") as k:
+            return "H" in winreg.QueryValueEx(k, "sShortTime")[0]
+    except OSError:
+        return True
+
+
 def make_icon(live=False, size=64):
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -744,6 +804,8 @@ class App:
         make_icon(size=256).save(ICON_ICO, sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)])
         self.cfg = load_config()
         save_config(self.cfg)
+        log(f"app: started (pid {os.getpid()}, {'exe' if FROZEN else 'source'}), "
+            f"twitch signed in: {bool(self.cfg['twitch_login'].get('access_token'))}")
         self.lock = threading.RLock()
         self.status = {}
         self.last_check = None
@@ -757,6 +819,8 @@ class App:
         self.twitch_auth = TwitchAuth(self)
         self.twitch, self.kick = TwitchApi(self.twitch_auth), KickApi()
         self.eventsub = TwitchEventSub(self)
+        self.schedules = {}  # twitch login -> {"segments", "vacation", "next_fetch"}
+        self.clock24 = system_uses_24h()
 
         api = JsApi(self)
         dark = self.effective_dark()
@@ -781,18 +845,28 @@ class App:
 
     # ----- Twitch sign-in
     def twitch_signed_in(self, login):
-        with self.lock:
-            self.cfg["twitch_login"] = login
-            save_config(self.cfg)
+        try:
+            with self.lock:
+                self.cfg["twitch_login"] = login
+                self.cfg["twitch_auth_error"] = ""
+                save_config(self.cfg)
+            log("twitch: sign-in saved to config")
+        except Exception:
+            import traceback
+            log("twitch: saving sign-in FAILED\n" + traceback.format_exc())
+            raise
         self.eventsub.restart()
         self.push_state()
         self.wake.set()
 
     def twitch_signed_out(self, error=""):
+        log(f"twitch: signed out ({error or 'by user'})")
         with self.lock:
             login = self.cfg.get("twitch_login") or {}
             self.cfg["twitch_login"] = {}
+            self.cfg["twitch_auth_error"] = error
             save_config(self.cfg)
+        log("twitch: sign-out saved to config")
         self.twitch_auth.error = error
         if login.get("access_token") and not error:
             threading.Thread(target=self.twitch_auth.revoke, args=(login,), daemon=True).start()
@@ -802,6 +876,7 @@ class App:
 
     def on_twitch_online(self, login, user_id, started):
         """EventSub says a stream just started: alert right away instead of waiting for the next poll."""
+        log(f"eventsub: {login} went live")
         key = ("twitch", (login or "").lower())
         with self.lock:
             entry = next((s for s in self.cfg["streamers"] if (s["platform"], s["name"]) == key), None)
@@ -841,11 +916,14 @@ class App:
             items = []
             for s in self.cfg["streamers"]:
                 st = self.status.get((s["platform"], s["name"]), {"state": "checking"})
+                sch = self.schedules.get(s["name"]) if s["platform"] == "twitch" else None
                 items.append({**st, "platform": s["platform"], "name": s["name"], "notify": s["notify"],
-                              "url": stream_url(s["platform"], s["name"])})
+                              "url": stream_url(s["platform"], s["name"]),
+                              "schedule": sch["segments"] if sch else [],
+                              "vacation": sch["vacation"] if sch else None})
             return {"streamers": items, "theme": self.cfg.get("theme", "system"),
                     "last_check": self.last_check, "has_keys": self.has_any_keys(),
-                    "flyout_pinned": bool(self.cfg["flyout"].get("pinned")),
+                    "flyout_pinned": bool(self.cfg["flyout"].get("pinned")), "clock24": self.clock24,
                     "twitch_auth": twitch}
 
     def push_state(self):
@@ -974,8 +1052,26 @@ class App:
                     err = describe_error(e)
                     results.update({(plat, n): {"state": "error", "error": err} for n in names})
             self.apply_results(results)
+            self.refresh_schedules([s["name"] for s in streamers if s["platform"] == "twitch"])
             self.wake.wait(interval)
             self.wake.clear()
+
+    def refresh_schedules(self, names):
+        """Twitch schedules change rarely: fetch each every 30 min (5 min after an error)."""
+        if not self.twitch_auth.mode():
+            return
+        changed = False
+        for n in names:
+            uid, cached = self.twitch.user_ids.get(n), self.schedules.get(n)
+            if not uid or (cached and time.time() < cached["next_fetch"]):
+                continue
+            try:
+                self.schedules[n] = {**self.twitch.schedule(uid), "next_fetch": time.time() + 1800}
+            except Exception:
+                self.schedules[n] = {**(cached or {"segments": [], "vacation": None}), "next_fetch": time.time() + 300}
+            changed = True
+        if changed:
+            self.push_state()
 
     def apply_results(self, results):
         to_notify = []
